@@ -1,5 +1,10 @@
 <script lang="ts">
 	import { onMount, tick } from "svelte";
+	import { LlamaService } from "$lib/services/LlamaService";
+	import { KokoroService } from "$lib/services/KokoroService";
+
+	import { SettingsService } from "$lib/services/SettingsService";
+	import voices from "$lib/data/voices.json";
 
 	let messages = $state<{ role: "user" | "assistant"; content: string }[]>(
 		[],
@@ -14,19 +19,25 @@
 	let kokoroInitialized = $state(false);
 	let initError = $state("");
 
+	// Services
+	const llamaService = new LlamaService();
+	const kokoroService = new KokoroService();
+	const settingsService = new SettingsService();
+
 	// Voice Mode State
 	let isRecording = $state(false);
 	let isMuted = $state(false);
 	let recognition: any;
-	let tts: any; // KokoroTTS instance
 	let ttsBuffer = "";
-	let isSpeaking = $state(false);
-	let generatingCount = $state(0);
-	let isGeneratingAudio = $derived(generatingCount > 0);
-	let generationId = 0;
-	let audioContext: AudioContext;
-	let audioQueue: AudioBuffer[] = [];
-	let isPlaying = false;
+	let isGeneratingAudio = $state(false);
+
+	// Settings
+	let selectedVoice = $state(settingsService.getVoice());
+
+	// Update isGeneratingAudio reactively
+	kokoroService.onStatusChange(() => {
+		isGeneratingAudio = kokoroService.isGeneratingAudio;
+	});
 
 	onMount(async () => {
 		if (typeof window !== "undefined") {
@@ -61,13 +72,20 @@
 		}
 	});
 
+	function handleVoiceChange(event: Event) {
+		const select = event.target as HTMLSelectElement;
+		const voiceId = select.value;
+		selectedVoice = voiceId;
+		settingsService.setVoice(voiceId);
+	}
+
 	async function initializeSystem() {
 		try {
 			// 1. Initialize Kokoro TTS
-			initKokoro();
+			await initKokoro();
 
 			// 2. Initialize/Check Ollama
-			initOllama();
+			await initOllama();
 		} catch (e) {
 			console.error("Initialization failed", e);
 			initError = "Failed to initialize system.";
@@ -76,15 +94,7 @@
 
 	async function initKokoro() {
 		try {
-			const { KokoroTTS } = await import("kokoro-js");
-			tts = await KokoroTTS.from_pretrained(
-				"onnx-community/Kokoro-82M-ONNX",
-				{
-					dtype: "q8",
-				},
-			);
-			audioContext = new (window.AudioContext ||
-				(window as any).webkitAudioContext)();
+			await kokoroService.initialize();
 			kokoroInitialized = true;
 			checkReady();
 		} catch (e) {
@@ -95,38 +105,24 @@
 
 	async function initOllama() {
 		try {
+			// Load system prompt
+			await llamaService.loadSystemPrompt();
+
 			// Check if running
-			let res = await fetch("/api/system/ollama");
-			let data = await res.json();
+			let running = await llamaService.checkStatus();
 
-			if (!data.running) {
-				// Try to start it
-				console.log("Ollama not running, attempting to start...");
-				res = await fetch("/api/system/ollama", { method: "POST" });
-				data = await res.json();
-
-				if (!data.success) {
-					throw new Error("Failed to auto-start Ollama.");
-				}
-
+			if (!running) {
 				// Wait for it to actually be ready
 				let retries = 10;
 				while (retries > 0) {
 					await new Promise((r) => setTimeout(r, 1000));
-					try {
-						const check = await fetch("/api/system/ollama");
-						const checkData = await check.json();
-						if (checkData.running) {
-							break;
-						}
-					} catch (e) {
-						/* ignore */
-					}
+					running = await llamaService.checkStatus();
+					if (running) break;
 					retries--;
 				}
 
-				if (retries === 0) {
-					throw new Error("Ollama started but not reachable.");
+				if (!running) {
+					throw new Error("Llama started but not reachable.");
 				}
 			}
 
@@ -134,7 +130,7 @@
 			checkReady();
 		} catch (e) {
 			console.error("Ollama init failed", e);
-			initError = "Failed to connect to Ollama. Is it installed?";
+			initError = "Failed to connect to LLM. Is it installed?";
 		}
 	}
 
@@ -160,67 +156,8 @@
 		}
 	}
 
-	async function playNextAudio() {
-		if (audioQueue.length === 0) {
-			isPlaying = false;
-			isSpeaking = false;
-			return;
-		}
-
-		isPlaying = true;
-		isSpeaking = true;
-		const buffer = audioQueue.shift()!;
-		const source = audioContext.createBufferSource();
-		source.buffer = buffer;
-		source.connect(audioContext.destination);
-		source.onended = () => {
-			playNextAudio();
-		};
-		source.start(0);
-	}
-
-	async function speakText(text: string) {
-		if (isMuted || !tts || !audioContext) return;
-
-		const myId = generationId;
-
-		try {
-			generatingCount++;
-			const audio = await tts.generate(text, { voice: "af_sky" });
-
-			if (myId !== generationId) return;
-
-			// audio.audio is a Float32Array, audio.sampling_rate is the rate
-			const audioBuffer = audioContext.createBuffer(
-				1,
-				audio.audio.length,
-				audio.sampling_rate,
-			);
-			audioBuffer.getChannelData(0).set(audio.audio);
-
-			audioQueue.push(audioBuffer);
-			if (!isPlaying) {
-				playNextAudio();
-			}
-		} catch (e) {
-			console.error("TTS Generation failed", e);
-		} finally {
-			generatingCount = Math.max(0, generatingCount - 1);
-		}
-	}
-
 	function stopSpeaking() {
-		generationId++; // Invalidate pending generations
-		audioQueue = [];
-		if (audioContext) {
-			audioContext.suspend().then(() => audioContext.resume());
-			// Or just close/recreate, but suspend/resume might not clear running buffers immediately if not handled.
-			// Better: disconnect all nodes?
-			// Simplest: just clear queue. The current playing one will finish or we can try to stop it if we kept a reference.
-			// For now, clearing queue is a good start.
-			isPlaying = false;
-			isSpeaking = false;
-		}
+		kokoroService.stop();
 	}
 
 	function processTTSBuffer(force = false) {
@@ -236,14 +173,14 @@
 			ttsBuffer = ttsBuffer.slice(endIdx);
 
 			if (sentence) {
-				speakText(sentence);
+				kokoroService.speak(sentence, selectedVoice);
 			}
 
 			match = ttsBuffer.match(sentenceEndings);
 		}
 
 		if (force && ttsBuffer.trim()) {
-			speakText(ttsBuffer.trim());
+			kokoroService.speak(ttsBuffer.trim(), selectedVoice);
 			ttsBuffer = "";
 		}
 	}
@@ -268,62 +205,26 @@
 		try {
 			// Add a placeholder for the assistant response
 			messages = [...messages, { role: "assistant", content: "" }];
+			const lastMsgIndex = messages.length - 1;
 
-			const response = await fetch("/api/chat", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					messages: messages.slice(0, -1), // Send history excluding the empty placeholder
-				}),
-			});
-
-			if (!response.ok) throw new Error("Failed to send message");
-			if (!response.body) throw new Error("No response body");
-
-			const reader = response.body.getReader();
-			const decoder = new TextDecoder();
-			let buffer = "";
-
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-
-				const chunk = decoder.decode(value, { stream: true });
-				buffer += chunk;
-
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-
-				for (const line of lines) {
-					if (!line.trim()) continue;
-					try {
-						const data = JSON.parse(line);
-						if (data.message?.content) {
-							const content = data.message.content;
-							const lastMsgIndex = messages.length - 1;
-							messages[lastMsgIndex].content += content;
-
-							// Accumulate for TTS but don't process yet (prevents UI freezing during stream)
-							ttsBuffer += content;
-
-							scrollToBottom();
-						}
-						if (data.done) {
-							loading = false;
-							processTTSBuffer(true); // Process the full buffer at once
-						}
-					} catch (e) {
-						console.error("Error parsing JSON chunk", e);
-					}
-				}
+			for await (const chunk of llamaService.chat(
+				messages.slice(0, -1),
+			)) {
+				messages[lastMsgIndex].content += chunk;
+				ttsBuffer += chunk;
+				processTTSBuffer(); // Process as we go
+				scrollToBottom();
 			}
+
+			loading = false;
+			processTTSBuffer(true); // Process remaining buffer
 		} catch (error) {
 			console.error(error);
 			messages = [
 				...messages,
 				{
 					role: "assistant",
-					content: "Error: Could not connect to Ollama.",
+					content: "Error: Could not connect to LLM.",
 				},
 			];
 		} finally {
@@ -409,7 +310,7 @@
 						class="{ollamaInitialized
 							? 'text-gray-200'
 							: 'text-gray-400'} text-sm font-medium"
-						>Starting Local Ollama...</span
+						>Starting Local LLM...</span
 					>
 				</div>
 
@@ -496,10 +397,24 @@
 				>
 					Local LLM Chat
 				</h1>
-				<p class="text-xs text-gray-400">Powered by Ollama</p>
+				<p class="text-xs text-gray-400">Powered by llama.cpp</p>
 			</div>
 		</div>
 		<div class="flex items-center gap-3">
+			<!-- Voice Selector -->
+			<select
+				bind:value={selectedVoice}
+				onchange={handleVoiceChange}
+				class="px-3 py-1 text-xs rounded-lg bg-gray-800 border border-gray-700 text-gray-300 focus:outline-none focus:border-indigo-500 hover:border-gray-600 transition-colors"
+				aria-label="Select voice"
+			>
+				{#each voices as voice}
+					<option value={voice.id}>
+						{voice.name} ({voice.language})
+					</option>
+				{/each}
+			</select>
+
 			<button
 				onclick={() => {
 					isMuted = !isMuted;
